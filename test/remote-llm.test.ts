@@ -352,6 +352,71 @@ describe("RemoteLLM", () => {
     }
   });
 
+  test("rerank() truncates long document text before sending while preserving original result mapping", async () => {
+    const receivedDocuments: string[][] = [];
+    const truncatingServer = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        if (req.url !== "/v1/rerank") {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: "not found" }));
+          return;
+        }
+
+        const parsed = JSON.parse(body) as { documents: string[] };
+        receivedDocuments.push(parsed.documents);
+
+        const results = parsed.documents.map((document, batchIndex) => {
+          const match = document.match(/^document-(\d+)/);
+          const originalIndex = Number(match?.[1] ?? -1);
+
+          return {
+            index: batchIndex,
+            relevance_score: 100 - originalIndex,
+          };
+        });
+
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ results }));
+      });
+    });
+    const truncatingBaseUrl = await listen(truncatingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: truncatingBaseUrl });
+      const longTail = Array.from({ length: 450 }, (_, i) => `chunkword${i}`).join(" ");
+      const docs = Array.from({ length: 5 }, (_, index) => ({
+        file: `long-${index}.md`,
+        text: `document-${index} ${longTail} ending-${index}`,
+      }));
+
+      expect(docs.every((doc) => doc.text.length > 2000)).toBe(true);
+
+      const result = await remote.rerank("long query", docs);
+
+      expect(receivedDocuments).toHaveLength(1);
+      expect(receivedDocuments[0]).toHaveLength(5);
+      for (const [index, document] of receivedDocuments[0]!.entries()) {
+        expect(document.length).toBeLessThanOrEqual(515);
+        expect(document.endsWith("...")).toBe(true);
+        expect(document).toContain(`document-${index}`);
+      }
+
+      expect(result.results).toEqual([
+        { file: "long-0.md", index: 0, score: 100 },
+        { file: "long-1.md", index: 1, score: 99 },
+        { file: "long-2.md", index: 2, score: 98 },
+        { file: "long-3.md", index: 3, score: 97 },
+        { file: "long-4.md", index: 4, score: 96 },
+      ]);
+      expect(docs[0]!.text.endsWith("...")).toBe(false);
+      expect(docs[0]!.text.length).toBeGreaterThan(2000);
+    } finally {
+      await closeServer(truncatingServer);
+    }
+  });
+
   test("rerank() throws when the server exceeds rerankTimeoutMs", async () => {
     const slowServer = http.createServer((req, res) => {
       if (req.url !== "/v1/rerank") {

@@ -40,6 +40,7 @@ const debug = !!process.env.QMD_REMOTE_DEBUG;
 const INDIVIDUAL_RETRY_DELAY_MS = 100;
 const MAX_INDIVIDUAL_EMBED_RETRIES = 10;
 const RERANK_BATCH_SIZE = 10;
+const RERANK_MAX_CHARS_PER_DOC = 512;
 
 function normalizeRemoteBaseUrl(baseUrl: string): string {
   const normalized = baseUrl.replace(/\/+$/, "");
@@ -55,6 +56,24 @@ function truncateRemoteErrorBody(body: string): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function truncateRerankDocumentText(text: string, index: number): string {
+  if (text.length <= RERANK_MAX_CHARS_PER_DOC) {
+    return text;
+  }
+
+  const truncatedAt = text.lastIndexOf(" ", RERANK_MAX_CHARS_PER_DOC);
+  const cleanLimit = truncatedAt > 0 ? truncatedAt : RERANK_MAX_CHARS_PER_DOC;
+  const truncated = `${text.slice(0, cleanLimit)}...`;
+
+  if (debug) {
+    process.stderr.write(
+      `[remote-llm] rerank: truncated doc[${index}] from ${text.length} to ${truncated.length} chars\n`,
+    );
+  }
+
+  return truncated;
 }
 
 export class RemoteLLM implements LLM {
@@ -213,7 +232,7 @@ export class RemoteLLM implements LLM {
       return { results: [], model };
     }
 
-    const texts = documents.map((d) => d.text);
+    const texts = documents.map((d, index) => truncateRerankDocumentText(d.text, index));
 
     if (debug) {
       process.stderr.write(`[remote-llm] POST ${this.baseUrl}/rerank model=${model} docs=${texts.length} query="${query.slice(0, 60)}"\n`);
