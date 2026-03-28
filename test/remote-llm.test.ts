@@ -195,6 +195,38 @@ describe("RemoteLLM", () => {
     expect(results[0]!.embedding).not.toEqual(results[1]!.embedding);
   });
 
+  test("embedBatch() sanitizes empty strings and unpaired surrogates before sending", async () => {
+    let capturedInput: string[] = [];
+    const embedServer = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(body);
+        capturedInput = parsed.input;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          data: capturedInput.map((text: string, index: number) => ({
+            embedding: [text.length, index],
+            index,
+          })),
+          model: parsed.model,
+        }));
+      });
+    });
+    const embedBaseUrl = await listen(embedServer);
+
+    try {
+      const remote = createRemote({ baseUrl: embedBaseUrl });
+      const results = await remote.embedBatch(["", "\uD800test", "ok\uDC00"]);
+
+      expect(results).toHaveLength(3);
+      expect(capturedInput).toEqual([" ", "test", "ok"]);
+      expect(capturedInput.every((text) => !/[\uD800-\uDFFF]/.test(text))).toBe(true);
+    } finally {
+      await closeServer(embedServer);
+    }
+  });
+
   // ── Reranking ──────────────────────────────────────────────────────────
 
   test("rerank() sends correct request format", async () => {
@@ -221,6 +253,83 @@ describe("RemoteLLM", () => {
     const remote = createRemote();
     const result = await remote.rerank("query", []);
     expect(result.results).toEqual([]);
+  });
+
+  test("rerank() supports Fireworks-style data responses", async () => {
+    const fireworksServer = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        res.setHeader("Content-Type", "application/json");
+        if (req.url === "/v1/rerank") {
+          res.end(JSON.stringify({
+            data: [
+              { index: 1, relevance_score: 0.97 },
+              { index: 0, relevance_score: 0.42 },
+            ],
+          }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: "not found" }));
+      });
+    });
+    const fireworksBaseUrl = await listen(fireworksServer);
+
+    try {
+      const remote = createRemote({ baseUrl: fireworksBaseUrl });
+      const docs = [
+        { file: "alpha.md", text: "alpha content" },
+        { file: "beta.md", text: "beta content" },
+      ];
+
+      const result = await remote.rerank("auth setup", docs);
+
+      expect(result.results).toEqual([
+        { file: "beta.md", index: 1, score: 0.97 },
+        { file: "alpha.md", index: 0, score: 0.42 },
+      ]);
+      expect(result.model).toBe("bge-reranker-v2-m3");
+    } finally {
+      await closeServer(fireworksServer);
+    }
+  });
+
+  test("rerank() throws when the server exceeds rerankTimeoutMs", async () => {
+    const slowServer = http.createServer((req, res) => {
+      if (req.url !== "/v1/rerank") {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: "not found" }));
+        return;
+      }
+
+      req.on("data", () => {});
+      req.on("end", () => {
+        setTimeout(() => {
+          if (!res.writableEnded) {
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ results: [{ index: 0, relevance_score: 1 }] }));
+          }
+        }, 200);
+      });
+    });
+    const slowBaseUrl = await listen(slowServer);
+
+    try {
+      const remote = createRemote({ baseUrl: slowBaseUrl, rerankTimeoutMs: 50 });
+
+      let caught: unknown;
+      try {
+        await remote.rerank("query", [{ file: "a.md", text: "doc" }]);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeTruthy();
+      expect(String(caught)).toMatch(/abort/i);
+    } finally {
+      await closeServer(slowServer);
+    }
   });
 
   test("rerank() rethrows remote failures instead of returning zero scores", async () => {
@@ -308,6 +417,56 @@ describe("RemoteLLM", () => {
     const remote = createRemote();
     const result = await remote.modelExists("nonexistent-model");
     expect(result.exists).toBe(false);
+  });
+
+  test("modelExists() returns false when the server returns non-200", async () => {
+    const failingServer = http.createServer((_req, res) => {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "boom" }));
+    });
+    const failingBaseUrl = await listen(failingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: failingBaseUrl });
+      await expect(remote.modelExists("bge-m3")).resolves.toEqual({ name: "bge-m3", exists: false });
+    } finally {
+      await closeServer(failingServer);
+    }
+  });
+
+  test("modelExists() returns false when the server times out", async () => {
+    const slowServer = http.createServer((_req, res) => {
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ data: [{ id: "bge-m3" }] }));
+        }
+      }, 200);
+    });
+    const slowBaseUrl = await listen(slowServer);
+
+    try {
+      const remote = createRemote({ baseUrl: slowBaseUrl, timeoutMs: 50 });
+      await expect(remote.modelExists("bge-m3")).resolves.toEqual({ name: "bge-m3", exists: false });
+    } finally {
+      await closeServer(slowServer);
+    }
+  });
+
+  test("modelExists() returns false when the server returns malformed JSON", async () => {
+    const malformedServer = http.createServer((_req, res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.end("{bad json");
+    });
+    const malformedBaseUrl = await listen(malformedServer);
+
+    try {
+      const remote = createRemote({ baseUrl: malformedBaseUrl });
+      await expect(remote.modelExists("bge-m3")).resolves.toEqual({ name: "bge-m3", exists: false });
+    } finally {
+      await closeServer(malformedServer);
+    }
   });
 
   test("constructor rejects non-http base URLs", () => {
@@ -575,6 +734,28 @@ describe("HybridLLM", () => {
     expect(results[0]!.text).toBe("expanded-locally");
   });
 
+  test("passes intent through to the local expandQuery implementation", async () => {
+    const remote = new RemoteLLM({ baseUrl: mockBaseUrl });
+    let capturedOptions: { context?: string; includeLexical?: boolean; intent?: string } | undefined;
+    const local = {
+      embed: async () => null,
+      embedBatch: async () => [],
+      generate: async () => null,
+      expandQuery: async (_query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }) => {
+        capturedOptions = options;
+        return [{ type: "vec" as const, text: "expanded-locally" }];
+      },
+      rerank: async () => ({ results: [], model: "local" }),
+      modelExists: async () => ({ name: "local", exists: true }),
+      dispose: async () => {},
+    };
+    const hybrid = new HybridLLM(local, remote);
+
+    await hybrid.expandQuery("auth", { intent: "find auth config" });
+
+    expect(capturedOptions).toEqual({ intent: "find auth config" });
+  });
+
   test("modelExists tries remote first then local", async () => {
     const remote = new RemoteLLM({ baseUrl: mockBaseUrl });
     const local = {
@@ -656,6 +837,10 @@ describe("HybridLLM", () => {
 });
 
 describe("getDefaultLlamaCpp", () => {
+  test("LlamaCpp instances are marked as local", () => {
+    expect(new LlamaCpp({}).isRemote).toBe(false);
+  });
+
   test("unwraps the local LlamaCpp from HybridLLM", () => {
     const local = new LlamaCpp({});
     const remote = {
