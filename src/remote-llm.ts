@@ -199,15 +199,19 @@ export class RemoteLLM implements LLM {
       }, this.rerankTimeoutMs);
 
       const json = await resp.json() as {
-        results: { index: number; relevance_score: number }[];
+        results?: { index: number; relevance_score: number }[];
+        data?: { index: number; relevance_score: number }[];
       };
 
+      // Support both Cohere format (results) and Fireworks format (data)
+      const ranked = json.results ?? json.data ?? [];
+
       if (debug) {
-        const top = json.results[0];
-        process.stderr.write(`[remote-llm] rerank done ${Date.now() - start}ms results=${json.results.length} top_score=${top?.relevance_score?.toFixed(4) ?? "N/A"}\n`);
+        const top = ranked[0];
+        process.stderr.write(`[remote-llm] rerank done ${Date.now() - start}ms results=${ranked.length} top_score=${top?.relevance_score?.toFixed(4) ?? "N/A"}\n`);
       }
 
-      const results = json.results.map((r) => ({
+      const results = ranked.map((r) => ({
         file: documents[r.index]?.file ?? "",
         score: r.relevance_score,
         index: r.index,
