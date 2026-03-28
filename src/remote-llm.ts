@@ -228,7 +228,7 @@ export class RemoteLLM implements LLM {
     throw new Error("RemoteLLM does not support generate(). Use local LlamaCpp for query expansion.");
   }
 
-  async expandQuery(_query: string, _options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(_query: string, _options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
     throw new Error("RemoteLLM does not support expandQuery(). Use local LlamaCpp for query expansion.");
   }
 

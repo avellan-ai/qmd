@@ -43,7 +43,7 @@ export class HybridLLM implements LLM {
     return this.local.generate(prompt, options);
   }
 
-  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]> {
     return this.local.expandQuery(query, options);
   }
 
