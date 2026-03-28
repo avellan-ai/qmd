@@ -79,6 +79,7 @@ import {
 import { LlamaCpp, disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLLM, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import { RemoteLLM } from "../remote-llm.js";
 import { HybridLLM } from "../hybrid-llm.js";
+import { FullRemoteLLM } from "../full-remote-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -106,16 +107,32 @@ import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedde
 enableProductionMode();
 
 // Configure remote LLM if QMD_REMOTE_URL is set.
-// Routes embed/rerank to remote server, keeps generate/expandQuery local.
-if (process.env.QMD_REMOTE_URL) {
-  const remote = new RemoteLLM({
-    baseUrl: process.env.QMD_REMOTE_URL,
-    embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
-    rerankModel: process.env.QMD_REMOTE_RERANK_MODEL,
-    apiKey: process.env.QMD_REMOTE_API_KEY,
-  });
-  const local = new LlamaCpp({});
-  setDefaultLLM(new HybridLLM(local, remote));
+// By default this uses hybrid mode; QMD_FULLY_REMOTE=1 routes all operations remotely.
+const remoteUrl = process.env.QMD_REMOTE_URL;
+const fullyRemote = process.env.QMD_FULLY_REMOTE === "1";
+
+if (remoteUrl) {
+  if (fullyRemote) {
+    setDefaultLLM(new FullRemoteLLM({
+      baseUrl: remoteUrl,
+      embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
+      rerankModel: process.env.QMD_REMOTE_RERANK_MODEL,
+      expandModel: process.env.QMD_REMOTE_EXPAND_MODEL,
+      generateModel: process.env.QMD_REMOTE_GENERATE_MODEL,
+      apiKey: process.env.QMD_REMOTE_API_KEY,
+    }));
+  } else {
+    const remote = new RemoteLLM({
+      baseUrl: remoteUrl,
+      embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
+      rerankModel: process.env.QMD_REMOTE_RERANK_MODEL,
+      apiKey: process.env.QMD_REMOTE_API_KEY,
+    });
+    const local = new LlamaCpp({});
+    setDefaultLLM(new HybridLLM(local, remote));
+  }
+} else if (fullyRemote) {
+  process.stderr.write("Warning: QMD_FULLY_REMOTE=1 was set but QMD_REMOTE_URL is not configured. Falling back to local LLM.\n");
 }
 
 // =============================================================================

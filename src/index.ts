@@ -70,6 +70,7 @@ import {
 } from "./llm.js";
 import { RemoteLLM } from "./remote-llm.js";
 import { HybridLLM } from "./hybrid-llm.js";
+import { FullRemoteLLM } from "./full-remote-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -124,24 +125,35 @@ export { Maintenance } from "./maintenance.js";
 // Re-export remote LLM types for advanced consumers
 export { RemoteLLM, type RemoteLLMConfig } from "./remote-llm.js";
 export { HybridLLM } from "./hybrid-llm.js";
+export { FullRemoteLLM, type FullRemoteLLMConfig } from "./full-remote-llm.js";
 
 /**
  * Create the appropriate LLM instance based on environment configuration.
  *
- * When QMD_REMOTE_URL is set, creates a HybridLLM that routes:
- * - embed/rerank → remote server (e.g. omlx with bge-m3, bge-reranker)
- * - generate/expandQuery → local LlamaCpp (QMD fine-tuned model)
+ * When QMD_REMOTE_URL is set, creates either:
+ * - FullRemoteLLM when QMD_FULLY_REMOTE=1
+ * - HybridLLM otherwise
  *
  * Without QMD_REMOTE_URL, returns a standard LlamaCpp instance.
  */
 function createLLM(): LLM {
-  const local = new LlamaCpp({
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
-
   const remoteUrl = process.env.QMD_REMOTE_URL;
   if (remoteUrl) {
+    if (process.env.QMD_FULLY_REMOTE === "1") {
+      return new FullRemoteLLM({
+        baseUrl: remoteUrl,
+        embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
+        rerankModel: process.env.QMD_REMOTE_RERANK_MODEL,
+        expandModel: process.env.QMD_REMOTE_EXPAND_MODEL,
+        generateModel: process.env.QMD_REMOTE_GENERATE_MODEL,
+        apiKey: process.env.QMD_REMOTE_API_KEY,
+      });
+    }
+
+    const local = new LlamaCpp({
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    });
     const remote = new RemoteLLM({
       baseUrl: remoteUrl,
       embedModel: process.env.QMD_REMOTE_EMBED_MODEL,
@@ -151,7 +163,10 @@ function createLLM(): LLM {
     return new HybridLLM(local, remote);
   }
 
-  return local;
+  return new LlamaCpp({
+    inactivityTimeoutMs: 5 * 60 * 1000,
+    disposeModelsOnInactivity: true,
+  });
 }
 
 /**

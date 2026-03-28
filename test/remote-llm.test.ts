@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { RemoteLLM, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
+import { FullRemoteLLM, type FullRemoteLLMConfig } from "../src/full-remote-llm.js";
 import http from "http";
 
 // =============================================================================
@@ -31,6 +32,29 @@ function createMockServer(): Promise<{ server: http.Server; baseUrl: string }> {
             index,
           }));
           res.end(JSON.stringify({ data, model: parsed.model }));
+        } else if (req.url === "/v1/chat/completions") {
+          const messages = parsed.messages as Array<{ role: string; content: string }>;
+          const system = messages.find((m) => m.role === "system")?.content ?? "";
+          const user = messages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+          const content = system.includes("search query expansion assistant")
+            ? [
+                `lex: ${user} keywords`,
+                `lex: "${user} phrase"`,
+                `vec: semantic ${user} explanation`,
+                `vec: related ${user} concept`,
+                `hyde: Information about ${user} in an ideal document`,
+              ].join("\n")
+            : `Generated response for ${user}`;
+          res.end(JSON.stringify({
+            model: parsed.model,
+            choices: [
+              {
+                message: {
+                  content,
+                },
+              },
+            ],
+          }));
         } else if (req.url === "/v1/rerank") {
           const docs = parsed.documents as string[];
           const results = docs.map((_: string, index: number) => ({
@@ -43,6 +67,8 @@ function createMockServer(): Promise<{ server: http.Server; baseUrl: string }> {
             data: [
               { id: "bge-m3" },
               { id: "bge-reranker-v2-m3" },
+              { id: "accounts/fireworks/models/qwen3-8b" },
+              { id: "chat-model" },
             ],
           }));
         } else {
@@ -225,6 +251,84 @@ describe("RemoteLLM", () => {
 
   test("dispose() is a no-op", async () => {
     const remote = createRemote();
+    await expect(remote.dispose()).resolves.toBeUndefined();
+  });
+});
+
+// =============================================================================
+// FullRemoteLLM Tests
+// =============================================================================
+
+describe("FullRemoteLLM", () => {
+  beforeAll(async () => {
+    const mock = await createMockServer();
+    server = mock.server;
+    baseUrl = mock.baseUrl;
+  });
+
+  afterAll(() => {
+    server?.close();
+  });
+
+  beforeEach(() => {
+    lastRequest = null;
+  });
+
+  function createFullRemote(overrides?: Partial<FullRemoteLLMConfig>): FullRemoteLLM {
+    return new FullRemoteLLM({
+      baseUrl,
+      embedModel: "bge-m3",
+      rerankModel: "bge-reranker-v2-m3",
+      expandModel: "accounts/fireworks/models/qwen3-8b",
+      generateModel: "chat-model",
+      ...overrides,
+    });
+  }
+
+  test("isRemote is true", () => {
+    const remote = createFullRemote();
+    expect(remote.isRemote).toBe(true);
+  });
+
+  test("generate() uses remote chat completions", async () => {
+    const remote = createFullRemote();
+    const result = await remote.generate("hello remote", { maxTokens: 50, temperature: 0.2 });
+
+    expect(result).not.toBeNull();
+    expect(result!.text).toContain("hello remote");
+    expect(result!.model).toBe("chat-model");
+    expect(lastRequest?.path).toBe("/v1/chat/completions");
+    expect(lastRequest?.body.model).toBe("chat-model");
+    expect(lastRequest?.body.max_tokens).toBe(50);
+    expect(lastRequest?.body.temperature).toBe(0.2);
+  });
+
+  test("expandQuery() parses lex vec and hyde lines from remote chat", async () => {
+    const remote = createFullRemote();
+    const result = await remote.expandQuery("auth setup");
+
+    expect(lastRequest?.path).toBe("/v1/chat/completions");
+    expect(lastRequest?.body.model).toBe("accounts/fireworks/models/qwen3-8b");
+    expect(result.some((q) => q.type === "lex")).toBe(true);
+    expect(result.some((q) => q.type === "vec")).toBe(true);
+    expect(result.some((q) => q.type === "hyde")).toBe(true);
+    expect(result.every((q) => /auth|setup/i.test(q.text))).toBe(true);
+  });
+
+  test("expandQuery() respects includeLexical=false", async () => {
+    const remote = createFullRemote();
+    const result = await remote.expandQuery("auth setup", { includeLexical: false });
+    expect(result.some((q) => q.type === "lex")).toBe(false);
+  });
+
+  test("modelExists() returns true for chat models", async () => {
+    const remote = createFullRemote();
+    const result = await remote.modelExists("chat-model");
+    expect(result.exists).toBe(true);
+  });
+
+  test("dispose() is a no-op", async () => {
+    const remote = createFullRemote();
     await expect(remote.dispose()).resolves.toBeUndefined();
   });
 });
