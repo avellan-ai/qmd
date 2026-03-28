@@ -39,6 +39,7 @@ export type RemoteLLMConfig = {
 const debug = !!process.env.QMD_REMOTE_DEBUG;
 const INDIVIDUAL_RETRY_DELAY_MS = 100;
 const MAX_INDIVIDUAL_EMBED_RETRIES = 10;
+const RERANK_BATCH_SIZE = 10;
 
 function normalizeRemoteBaseUrl(baseUrl: string): string {
   const normalized = baseUrl.replace(/\/+$/, "");
@@ -220,24 +221,56 @@ export class RemoteLLM implements LLM {
     const start = Date.now();
 
     try {
-      const resp = await this.fetchWithTimeout(`${this.baseUrl}/rerank`, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify({
-          model,
-          query,
-          documents: texts,
-          return_documents: false,
-        }),
-      }, this.rerankTimeoutMs);
+      const rerankBatch = async (
+        batchTexts: string[],
+        offset: number,
+        batchIndex: number,
+        batchCount: number,
+      ): Promise<{ index: number; relevance_score: number }[]> => {
+        if (debug && batchCount > 1) {
+          process.stderr.write(
+            `[remote-llm] rerank batch ${batchIndex + 1}/${batchCount} (${batchTexts.length} docs)...\n`,
+          );
+        }
 
-      const json = await resp.json() as {
-        results?: { index: number; relevance_score: number }[];
-        data?: { index: number; relevance_score: number }[];
+        const resp = await this.fetchWithTimeout(`${this.baseUrl}/rerank`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify({
+            model,
+            query,
+            documents: batchTexts,
+            return_documents: false,
+          }),
+        }, this.rerankTimeoutMs);
+
+        const json = await resp.json() as {
+          results?: { index: number; relevance_score: number }[];
+          data?: { index: number; relevance_score: number }[];
+        };
+
+        return (json.results ?? json.data ?? []).map((result) => ({
+          index: result.index + offset,
+          relevance_score: result.relevance_score,
+        }));
       };
 
-      // Support both Cohere format (results) and Fireworks format (data)
-      const ranked = json.results ?? json.data ?? [];
+      let ranked: { index: number; relevance_score: number }[];
+      if (documents.length <= RERANK_BATCH_SIZE) {
+        ranked = await rerankBatch(texts, 0, 0, 1);
+      } else {
+        const batchCount = Math.ceil(texts.length / RERANK_BATCH_SIZE);
+        ranked = [];
+
+        for (let batchIndex = 0; batchIndex < batchCount; batchIndex++) {
+          const offset = batchIndex * RERANK_BATCH_SIZE;
+          const batchTexts = texts.slice(offset, offset + RERANK_BATCH_SIZE);
+          const batchResults = await rerankBatch(batchTexts, offset, batchIndex, batchCount);
+          ranked.push(...batchResults);
+        }
+
+        ranked.sort((a, b) => b.relevance_score - a.relevance_score);
+      }
 
       if (debug) {
         const top = ranked[0];

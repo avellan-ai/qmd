@@ -295,6 +295,63 @@ describe("RemoteLLM", () => {
     }
   });
 
+  test("rerank() batches large document sets and restores original indexes", async () => {
+    const batchRequests: Array<{ documents: string[] }> = [];
+    const batchingServer = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        if (req.url !== "/v1/rerank") {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: "not found" }));
+          return;
+        }
+
+        const parsed = JSON.parse(body) as { documents: string[] };
+        batchRequests.push({ documents: parsed.documents });
+
+        const batchNumber = batchRequests.length;
+        const responseItems = parsed.documents.map((document, batchIndex) => {
+          const match = document.match(/^document-(\d+)$/);
+          const globalIndex = Number(match?.[1] ?? -1);
+
+          return {
+            index: batchIndex,
+            relevance_score: globalIndex,
+          };
+        });
+
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(batchNumber % 2 === 1 ? { results: responseItems } : { data: responseItems }));
+      });
+    });
+    const batchingBaseUrl = await listen(batchingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: batchingBaseUrl });
+      const docs = Array.from({ length: 25 }, (_, index) => ({
+        file: `doc-${index}.md`,
+        text: `document-${index}`,
+      }));
+
+      const result = await remote.rerank("batch me", docs);
+
+      expect(batchRequests.map((request) => request.documents.length)).toEqual([10, 10, 5]);
+      expect(result.results).toHaveLength(25);
+      expect(result.results.map((entry) => entry.index)).toEqual(
+        Array.from({ length: 25 }, (_, index) => 24 - index),
+      );
+      expect(result.results.map((entry) => entry.file)).toEqual(
+        Array.from({ length: 25 }, (_, index) => `doc-${24 - index}.md`),
+      );
+      expect(result.results.map((entry) => entry.score)).toEqual(
+        Array.from({ length: 25 }, (_, index) => 24 - index),
+      );
+    } finally {
+      await closeServer(batchingServer);
+    }
+  });
+
   test("rerank() throws when the server exceeds rerankTimeoutMs", async () => {
     const slowServer = http.createServer((req, res) => {
       if (req.url !== "/v1/rerank") {
