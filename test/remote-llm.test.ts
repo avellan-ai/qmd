@@ -1,7 +1,8 @@
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { RemoteLLM, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
 import { FullRemoteLLM, type FullRemoteLLMConfig } from "../src/full-remote-llm.js";
+import { LlamaCpp, getDefaultLlamaCpp, setDefaultLLM } from "../src/llm.js";
 import http from "http";
 
 // =============================================================================
@@ -13,6 +14,26 @@ let baseUrl: string;
 
 // Track last requests for assertions
 let lastRequest: { path: string; body: any } | null = null;
+
+function listen(server: http.Server): Promise<string> {
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (typeof addr === "object" && addr) {
+        resolve(`http://127.0.0.1:${addr.port}/v1`);
+      }
+    });
+  });
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
 
 function createMockServer(): Promise<{ server: http.Server; baseUrl: string }> {
   return new Promise((resolve) => {
@@ -130,6 +151,15 @@ describe("RemoteLLM", () => {
     expect(result!.model).toBe("bge-m3");
   });
 
+  test("embed() uses caller-provided model override", async () => {
+    const remote = createRemote();
+    const result = await remote.embed("hello world", { model: "custom-embed-model" });
+
+    expect(result).not.toBeNull();
+    expect(result!.model).toBe("custom-embed-model");
+    expect(lastRequest?.body.model).toBe("custom-embed-model");
+  });
+
   test("embedBatch() sends correct request format", async () => {
     const remote = createRemote();
     const texts = ["hello", "world", "test"];
@@ -140,6 +170,15 @@ describe("RemoteLLM", () => {
     expect(lastRequest?.path).toBe("/v1/embeddings");
     expect(lastRequest?.body.model).toBe("bge-m3");
     expect(lastRequest?.body.input).toEqual(texts);
+  });
+
+  test("embedBatch() uses caller-provided model override", async () => {
+    const remote = createRemote();
+    const results = await remote.embedBatch(["hello", "world"], { model: "batch-override-model" });
+
+    expect(results).toHaveLength(2);
+    expect(results.every((r) => r?.model === "batch-override-model")).toBe(true);
+    expect(lastRequest?.body.model).toBe("batch-override-model");
   });
 
   test("embedBatch() returns empty array for empty input", async () => {
@@ -184,6 +223,78 @@ describe("RemoteLLM", () => {
     expect(result.results).toEqual([]);
   });
 
+  test("rerank() rethrows remote failures instead of returning zero scores", async () => {
+    const failingServer = http.createServer((req, res) => {
+      res.statusCode = req.url === "/v1/rerank" ? 503 : 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "rerank unavailable" }));
+    });
+    const failingBaseUrl = await listen(failingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: failingBaseUrl });
+      await expect(
+        remote.rerank("query", [{ file: "a.md", text: "doc" }]),
+      ).rejects.toThrow("Remote LLM error 503: {\"error\":\"rerank unavailable\"}");
+    } finally {
+      await closeServer(failingServer);
+    }
+  });
+
+  test("rerank() truncates upstream error bodies in thrown errors", async () => {
+    const longBody = "x".repeat(250);
+    const failingServer = http.createServer((_req, res) => {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "text/plain");
+      res.end(longBody);
+    });
+    const failingBaseUrl = await listen(failingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: failingBaseUrl });
+      await expect(
+        remote.rerank("query", [{ file: "a.md", text: "doc" }]),
+      ).rejects.toThrow(`Remote LLM error 500: ${"x".repeat(200)}`);
+      await expect(
+        remote.rerank("query", [{ file: "a.md", text: "doc" }]),
+      ).rejects.not.toThrow("x".repeat(201));
+    } finally {
+      await closeServer(failingServer);
+    }
+  });
+
+  test("embedBatch() caps individual retries and skips the remainder", async () => {
+    const requestTimes: number[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failingServer = http.createServer((req, res) => {
+      if (req.url === "/v1/embeddings") {
+        requestTimes.push(Date.now());
+      }
+      res.statusCode = 429;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "rate limited" }));
+    });
+    const failingBaseUrl = await listen(failingServer);
+
+    try {
+      const remote = createRemote({ baseUrl: failingBaseUrl });
+      const start = Date.now();
+      const results = await remote.embedBatch(Array.from({ length: 12 }, (_, i) => `chunk-${i}`));
+      const elapsed = Date.now() - start;
+
+      expect(results).toHaveLength(12);
+      expect(results.every((result) => result === null)).toBe(true);
+      expect(requestTimes).toHaveLength(11);
+      expect(elapsed).toBeGreaterThanOrEqual(850);
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[remote-llm] individual embed retry cap hit at 10; skipping remaining 2 items",
+      );
+    } finally {
+      warnSpy.mockRestore();
+      await closeServer(failingServer);
+    }
+  });
+
   // ── Model Exists ───────────────────────────────────────────────────────
 
   test("modelExists() returns true for available model", async () => {
@@ -197,6 +308,12 @@ describe("RemoteLLM", () => {
     const remote = createRemote();
     const result = await remote.modelExists("nonexistent-model");
     expect(result.exists).toBe(false);
+  });
+
+  test("constructor rejects non-http base URLs", () => {
+    expect(() => createRemote({ baseUrl: "ftp://example.com/v1" })).toThrow(
+      "Remote LLM baseUrl must start with http:// or https://",
+    );
   });
 
   // ── Unsupported Operations ─────────────────────────────────────────────
@@ -325,6 +442,12 @@ describe("FullRemoteLLM", () => {
     const remote = createFullRemote();
     const result = await remote.modelExists("chat-model");
     expect(result.exists).toBe(true);
+  });
+
+  test("constructor rejects non-http base URLs", () => {
+    expect(() =>
+      createFullRemote({ baseUrl: "ssh://example.com/v1" }),
+    ).toThrow("Remote LLM baseUrl must start with http:// or https://");
   });
 
   test("dispose() is a no-op", async () => {
@@ -500,5 +623,76 @@ describe("HybridLLM", () => {
     await hybrid.dispose();
     expect(localDisposed).toBe(true);
     expect(remoteDisposed).toBe(true);
+  });
+
+  test("exposes the underlying local LLM", () => {
+    const remote = new RemoteLLM({ baseUrl: mockBaseUrl });
+    const local = new LlamaCpp({});
+    const hybrid = new HybridLLM(local, remote);
+
+    expect(hybrid.getLocal()).toBe(local);
+  });
+
+  test("delegates tokenization helpers to the local LLM when available", async () => {
+    const remote = new RemoteLLM({ baseUrl: mockBaseUrl });
+    const local = {
+      embed: async () => null,
+      embedBatch: async () => [],
+      generate: async () => null,
+      expandQuery: async () => [],
+      rerank: async () => ({ results: [], model: "local" }),
+      modelExists: async () => ({ name: "local", exists: true }),
+      dispose: async () => {},
+      tokenize: async (text: string) => text.split("").map((_, index) => index),
+      countTokens: async (text: string) => text.length,
+      detokenize: async (tokens: readonly unknown[]) => `count:${tokens.length}`,
+    };
+    const hybrid = new HybridLLM(local, remote);
+
+    await expect(hybrid.tokenize("abc")).resolves.toEqual([0, 1, 2]);
+    await expect(hybrid.countTokens("abcd")).resolves.toBe(4);
+    await expect(hybrid.detokenize([1, 2, 3])).resolves.toBe("count:3");
+  });
+});
+
+describe("getDefaultLlamaCpp", () => {
+  test("unwraps the local LlamaCpp from HybridLLM", () => {
+    const local = new LlamaCpp({});
+    const remote = {
+      embed: async () => null,
+      embedBatch: async () => [],
+      generate: async () => null,
+      expandQuery: async () => [],
+      rerank: async () => ({ results: [] as any[], model: "remote" }),
+      modelExists: async () => ({ name: "remote", exists: false }),
+      dispose: async () => {},
+      isRemote: true as const,
+    };
+
+    setDefaultLLM(new HybridLLM(local, remote));
+    try {
+      expect(getDefaultLlamaCpp()).toBe(local);
+    } finally {
+      setDefaultLLM(null);
+    }
+  });
+
+  test("throws a descriptive error for fully remote defaults", () => {
+    setDefaultLLM({
+      embed: async () => null,
+      embedBatch: async () => [],
+      generate: async () => null,
+      expandQuery: async () => [],
+      rerank: async () => ({ results: [] as any[], model: "remote" }),
+      modelExists: async () => ({ name: "remote", exists: true }),
+      dispose: async () => {},
+      isRemote: true,
+    });
+
+    try {
+      expect(() => getDefaultLlamaCpp()).toThrow(/does not expose a local LlamaCpp instance/i);
+    } finally {
+      setDefaultLLM(null);
+    }
   });
 });

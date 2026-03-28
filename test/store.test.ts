@@ -2599,6 +2599,14 @@ describe("Embedding batching", () => {
     };
   }
 
+  function createExactTokenizer() {
+    return {
+      async tokenize(text: string) {
+        return new Array(Math.max(1, text.length)).fill(1);
+      },
+    };
+  }
+
   function createFakeEmbedLlm() {
     const embedBatchCalls: string[][] = [];
     return {
@@ -2691,6 +2699,48 @@ describe("Embedding batching", () => {
         "maxBatchBytes"
       );
     } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings rolls back partial document embeddings so they retry next run", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fakeLlm = {
+      async embed(_text: string) {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        return texts.map((_text, index) => (
+          index === 0
+            ? { embedding: [0.1, 0.2, 0.3], model: "fake-embed" }
+            : null
+        ));
+      },
+    };
+
+    setDefaultLlamaCpp(createExactTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(db, "docs", {
+        name: "partial",
+        body: "# Partial\n\n" + "A".repeat(1200),
+      });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.chunksEmbedded).toBe(0);
+      expect(result.errors).toBeGreaterThan(0);
+      expect(db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get()).toEqual({ count: 0 });
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("partial embedding failure")
+      );
+    } finally {
+      warnSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }

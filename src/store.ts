@@ -20,7 +20,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import {
   LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -64,7 +64,7 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * falls back to the global singleton.
  */
 function getLlm(store: Store): LLM {
-  return store.llm ?? getDefaultLlamaCpp();
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1344,6 +1344,12 @@ export async function generateEmbeddings(
     for (const batchMeta of batches) {
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
+      const docEmbeddingState = new Map<string, {
+        path: string;
+        expectedChunks: number;
+        insertedChunks: number;
+        failedChunks: number;
+      }>();
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
       for (const doc of batchDocs) {
@@ -1363,6 +1369,13 @@ export async function generateEmbeddings(
             bytes: encoder.encode(chunks[seq]!.text).length,
           });
         }
+
+        docEmbeddingState.set(doc.hash, {
+          path: doc.path,
+          expectedChunks: chunks.length,
+          insertedChunks: 0,
+          failedChunks: 0,
+        });
       }
 
       totalChunks += batchChunks.length;
@@ -1397,28 +1410,33 @@ export async function generateEmbeddings(
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
+            const state = docEmbeddingState.get(chunk.hash)!;
             if (embedding) {
               insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-              chunksEmbedded++;
+              state.insertedChunks++;
             } else {
               errors++;
+              state.failedChunks++;
             }
             batchChunkBytesProcessed += chunk.bytes;
           }
         } catch {
           // Batch failed — try individual embeddings as fallback
           for (const chunk of chunkBatch) {
+            const state = docEmbeddingState.get(chunk.hash)!;
             try {
               const text = formatDoc(chunk.text, chunk.title);
               const result = await session.embed(text);
               if (result) {
                 insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-                chunksEmbedded++;
+                state.insertedChunks++;
               } else {
                 errors++;
+                state.failedChunks++;
               }
             } catch {
               errors++;
+              state.failedChunks++;
             }
             batchChunkBytesProcessed += chunk.bytes;
           }
@@ -1434,6 +1452,21 @@ export async function generateEmbeddings(
           totalBytes,
           errors,
         });
+      }
+
+      for (const [hash, state] of docEmbeddingState) {
+        const embeddedAllChunks = state.insertedChunks === state.expectedChunks && state.failedChunks === 0;
+        if (!embeddedAllChunks) {
+          if (state.insertedChunks > 0) {
+            deleteEmbeddingsForHash(db, hash);
+          }
+          console.warn(
+            `QMD Warning: partial embedding failure for ${state.path} (${state.insertedChunks}/${state.expectedChunks} chunks succeeded). The document will be retried on the next embed run.`
+          );
+          continue;
+        }
+
+        chunksEmbedded += state.insertedChunks;
       }
 
       bytesProcessed += batchBytes;
@@ -2099,11 +2132,10 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  // Tokenization requires an LLM with tokenize() method (LlamaCpp or a fake in tests).
-  // If the default LLM doesn't support tokenization (e.g. HybridLLM), fall back to char-based chunking.
-  const defaultLlm = getDefaultLlamaCpp();
-  const hasTokenizer = typeof (defaultLlm as any).tokenize === 'function';
-  if (!hasTokenizer) {
+  const defaultLlm = getDefaultLLM() as LLM & {
+    tokenize?: (text: string) => Promise<readonly unknown[]>;
+  };
+  if (typeof defaultLlm.tokenize !== "function") {
     return chunkDocument(content, maxTokens * 4, overlapTokens * 4, windowTokens * 4)
       .map(c => ({ text: c.text, pos: c.pos, tokens: Math.ceil(c.text.length / 4) }));
   }
@@ -2921,7 +2953,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // =============================================================================
 
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Remote LLMs handle formatting server-side; skip local task prefixes
   const formattedText = llm.isRemote
     ? text
@@ -2954,6 +2986,17 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+}
+
+function deleteEmbeddingsForHash(db: Database, hash: string): void {
+  try {
+    db.prepare(`DELETE FROM vectors_vec WHERE hash_seq IN (
+      SELECT hash || '_' || seq FROM content_vectors WHERE hash = ?
+    )`).run(hash);
+  } catch {
+    // sqlite-vec may be unavailable, or the virtual table may not exist yet.
+  }
+  db.prepare(`DELETE FROM content_vectors WHERE hash = ?`).run(hash);
 }
 
 /**
@@ -2999,7 +3042,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
@@ -3045,7 +3088,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLLM();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 

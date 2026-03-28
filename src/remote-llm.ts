@@ -37,6 +37,24 @@ export type RemoteLLMConfig = {
 };
 
 const debug = !!process.env.QMD_REMOTE_DEBUG;
+const INDIVIDUAL_RETRY_DELAY_MS = 100;
+const MAX_INDIVIDUAL_EMBED_RETRIES = 10;
+
+function normalizeRemoteBaseUrl(baseUrl: string): string {
+  const normalized = baseUrl.replace(/\/+$/, "");
+  if (!/^https?:\/\//.test(normalized)) {
+    throw new Error("Remote LLM baseUrl must start with http:// or https://");
+  }
+  return normalized;
+}
+
+function truncateRemoteErrorBody(body: string): string {
+  return body.slice(0, 200);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class RemoteLLM implements LLM {
   private baseUrl: string;
@@ -49,8 +67,7 @@ export class RemoteLLM implements LLM {
   readonly isRemote = true;
 
   constructor(config: RemoteLLMConfig) {
-    // Normalize: strip trailing slash
-    this.baseUrl = config.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = normalizeRemoteBaseUrl(config.baseUrl);
     this.apiKey = config.apiKey;
     this.embedModel = config.embedModel ?? "bge-m3";
     this.rerankModel = config.rerankModel ?? "bge-reranker-v2-m3";
@@ -73,10 +90,10 @@ export class RemoteLLM implements LLM {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs ?? this.timeoutMs);
     try {
-      const resp = await fetch(url, { ...init, signal: controller.signal });
+      const resp = await fetch(url, { ...init, redirect: "error", signal: controller.signal });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
-        throw new Error(`Remote LLM error ${resp.status}: ${body}`);
+        throw new Error(`Remote LLM error ${resp.status}: ${truncateRemoteErrorBody(body)}`);
       }
       return resp;
     } finally {
@@ -84,13 +101,14 @@ export class RemoteLLM implements LLM {
     }
   }
 
-  async embed(text: string, _options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    const results = await this.embedBatch([text]);
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    const results = await this.embedBatch([text], options);
     return results[0] ?? null;
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
+    const model = options?.model ?? this.embedModel;
 
     // Sanitize inputs to avoid remote tokenizer errors:
     // 1. Replace empty/non-string entries with a space
@@ -106,7 +124,7 @@ export class RemoteLLM implements LLM {
     });
 
     if (debug) {
-      process.stderr.write(`[remote-llm] POST ${this.baseUrl}/embeddings model=${this.embedModel} texts=${sanitized.length}\n`);
+      process.stderr.write(`[remote-llm] POST ${this.baseUrl}/embeddings model=${model} texts=${sanitized.length}\n`);
     }
     const start = Date.now();
 
@@ -115,7 +133,7 @@ export class RemoteLLM implements LLM {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({
-          model: this.embedModel,
+          model,
           input: sanitized,
         }),
       });
@@ -139,7 +157,7 @@ export class RemoteLLM implements LLM {
       return texts.map((_, i) => {
         const embedding = resultMap.get(i);
         if (!embedding) return null;
-        return { embedding, model: json.model || this.embedModel };
+        return { embedding, model: json.model || model };
       });
     } catch (error) {
       if (debug) {
@@ -149,15 +167,29 @@ export class RemoteLLM implements LLM {
       // Batch failed — retry each text individually to isolate bad inputs
       const results: (EmbeddingResult | null)[] = [];
       for (let i = 0; i < sanitized.length; i++) {
+        if (i >= MAX_INDIVIDUAL_EMBED_RETRIES) {
+          if (i === MAX_INDIVIDUAL_EMBED_RETRIES) {
+            console.warn(
+              `[remote-llm] individual embed retry cap hit at ${MAX_INDIVIDUAL_EMBED_RETRIES}; skipping remaining ${sanitized.length - i} items`,
+            );
+          }
+          results.push(null);
+          continue;
+        }
+
+        if (i > 0) {
+          await delay(INDIVIDUAL_RETRY_DELAY_MS);
+        }
+
         try {
           const resp = await this.fetchWithTimeout(`${this.baseUrl}/embeddings`, {
             method: "POST",
             headers: this.headers(),
-            body: JSON.stringify({ model: this.embedModel, input: [sanitized[i]] }),
+            body: JSON.stringify({ model, input: [sanitized[i]] }),
           });
           const json = await resp.json() as { data: { embedding: number[]; index: number }[]; model: string };
           const emb = json.data[0]?.embedding;
-          results.push(emb ? { embedding: emb, model: json.model || this.embedModel } : null);
+          results.push(emb ? { embedding: emb, model: json.model || model } : null);
         } catch (e) {
           if (debug) {
             const preview = sanitized[i]!.slice(0, 120).replace(/\n/g, "\\n");
@@ -173,16 +205,17 @@ export class RemoteLLM implements LLM {
   async rerank(
     query: string,
     documents: RerankDocument[],
-    _options?: RerankOptions
+    options?: RerankOptions
   ): Promise<RerankResult> {
+    const model = options?.model ?? this.rerankModel;
     if (documents.length === 0) {
-      return { results: [], model: this.rerankModel };
+      return { results: [], model };
     }
 
     const texts = documents.map((d) => d.text);
 
     if (debug) {
-      process.stderr.write(`[remote-llm] POST ${this.baseUrl}/rerank model=${this.rerankModel} docs=${texts.length} query="${query.slice(0, 60)}"\n`);
+      process.stderr.write(`[remote-llm] POST ${this.baseUrl}/rerank model=${model} docs=${texts.length} query="${query.slice(0, 60)}"\n`);
     }
     const start = Date.now();
 
@@ -191,7 +224,7 @@ export class RemoteLLM implements LLM {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({
-          model: this.rerankModel,
+          model,
           query,
           documents: texts,
           return_documents: false,
@@ -217,14 +250,10 @@ export class RemoteLLM implements LLM {
         index: r.index,
       }));
 
-      return { results, model: this.rerankModel };
+      return { results, model };
     } catch (error) {
       console.error("Remote rerank error:", error);
-      // Return all documents with score 0 as fallback
-      return {
-        results: documents.map((d, i) => ({ file: d.file, score: 0, index: i })),
-        model: this.rerankModel,
-      };
+      throw error;
     }
   }
 

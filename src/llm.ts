@@ -155,7 +155,7 @@ export type LLMSessionOptions = {
  */
 export interface ILLMSession {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
   expandQuery(query: string, options?: { context?: string; includeLexical?: boolean; intent?: string }): Promise<Queryable[]>;
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
   /** Whether this session is still valid (not released or aborted) */
@@ -320,7 +320,7 @@ export interface LLM {
   /**
    * Batch embed multiple texts efficiently
    */
-  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -895,7 +895,7 @@ export class LlamaCpp implements LLM {
    * Batch embed multiple texts efficiently
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1432,8 +1432,8 @@ class LLMSession implements ILLMSession {
     return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLLM().embedBatch(texts));
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts, options));
   }
 
   async expandQuery(
@@ -1542,7 +1542,20 @@ export function getDefaultLLM(): LLM {
 
 /** @deprecated Use getDefaultLLM() instead */
 export function getDefaultLlamaCpp(): LlamaCpp {
-  return getDefaultLLM() as LlamaCpp;
+  const llm = getDefaultLLM();
+  if (llm instanceof LlamaCpp) {
+    return llm;
+  }
+
+  const maybeLocal = (llm as LLM & { getLocal?: () => LLM }).getLocal?.();
+  if (maybeLocal instanceof LlamaCpp) {
+    return maybeLocal;
+  }
+
+  const llmName = llm?.constructor?.name ?? "UnknownLLM";
+  throw new Error(
+    `Default LLM does not expose a local LlamaCpp instance (got ${llmName}).`
+  );
 }
 
 /**

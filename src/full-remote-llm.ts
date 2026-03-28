@@ -64,6 +64,18 @@ const EXPAND_SYSTEM_PROMPT =
   "- Include at least one term from the original query in each line\n" +
   "- No explanations, no markdown, no extra text";
 
+function normalizeFullRemoteBaseUrl(baseUrl: string): string {
+  const normalized = baseUrl.replace(/\/+$/, "");
+  if (!/^https?:\/\//.test(normalized)) {
+    throw new Error("Remote LLM baseUrl must start with http:// or https://");
+  }
+  return normalized;
+}
+
+function truncateRemoteErrorBody(body: string): string {
+  return body.slice(0, 200);
+}
+
 function sanitizeRemoteText(text: string, fallback = " "): string {
   if (typeof text !== "string" || text.trim().length === 0) {
     return fallback;
@@ -161,7 +173,7 @@ export class FullRemoteLLM implements LLM {
   readonly isRemote = true;
 
   constructor(config: FullRemoteLLMConfig) {
-    this.baseUrl = config.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = normalizeFullRemoteBaseUrl(config.baseUrl);
     this.apiKey = config.apiKey;
     this.timeoutMs = config.timeoutMs ?? 30_000;
     this.expandModel = config.expandModel ?? DEFAULT_CHAT_MODEL;
@@ -198,10 +210,10 @@ export class FullRemoteLLM implements LLM {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs ?? this.timeoutMs);
     try {
-      const resp = await fetch(url, { ...init, signal: controller.signal });
+      const resp = await fetch(url, { ...init, redirect: "error", signal: controller.signal });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
-        throw new Error(`Remote LLM error ${resp.status}: ${body}`);
+        throw new Error(`Remote LLM error ${resp.status}: ${truncateRemoteErrorBody(body)}`);
       }
       return resp;
     } finally {
@@ -213,8 +225,8 @@ export class FullRemoteLLM implements LLM {
     return this.remote.embed(text, options);
   }
 
-  async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.remote.embedBatch(texts);
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.remote.embedBatch(texts, options);
   }
 
   async rerank(
