@@ -336,7 +336,7 @@ describe("RemoteLLM", () => {
 
       const result = await remote.rerank("batch me", docs);
 
-      expect(batchRequests.map((request) => request.documents.length)).toEqual([10, 10, 5]);
+      expect(batchRequests.map((request) => request.documents.length)).toEqual([5, 5, 5, 5, 5]);
       expect(result.results).toHaveLength(25);
       expect(result.results.map((entry) => entry.index)).toEqual(
         Array.from({ length: 25 }, (_, index) => 24 - index),

@@ -39,8 +39,10 @@ export type RemoteLLMConfig = {
 const debug = !!process.env.QMD_REMOTE_DEBUG;
 const INDIVIDUAL_RETRY_DELAY_MS = 100;
 const MAX_INDIVIDUAL_EMBED_RETRIES = 10;
-const RERANK_BATCH_SIZE = 10;
-const RERANK_MAX_CHARS_PER_DOC = 512;
+const RERANK_BATCH_SIZE = 5;
+const RERANK_MAX_CHARS_PER_DOC = 256;
+const MAX_RERANK_RETRIES = 3;
+const INITIAL_RERANK_RETRY_DELAY_MS = 500;
 
 function normalizeRemoteBaseUrl(baseUrl: string): string {
   const normalized = baseUrl.replace(/\/+$/, "");
@@ -58,14 +60,32 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function sanitizeRerankText(text: string): string {
+  return text
+    .replace(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]|\uFFFD/g,
+      "",
+    )
+    .replace(/\r\n/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/\t/g, " ")
+    .replace(/[`~]/g, "")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, "")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
 function truncateRerankDocumentText(text: string, index: number): string {
-  if (text.length <= RERANK_MAX_CHARS_PER_DOC) {
-    return text;
+  const clean = sanitizeRerankText(text);
+
+  if (clean.length <= RERANK_MAX_CHARS_PER_DOC) {
+    return clean;
   }
 
-  const truncatedAt = text.lastIndexOf(" ", RERANK_MAX_CHARS_PER_DOC);
+  const truncatedAt = clean.lastIndexOf(" ", RERANK_MAX_CHARS_PER_DOC);
   const cleanLimit = truncatedAt > 0 ? truncatedAt : RERANK_MAX_CHARS_PER_DOC;
-  const truncated = `${text.slice(0, cleanLimit)}...`;
+  const truncated = `${clean.slice(0, cleanLimit)}...`;
 
   if (debug) {
     process.stderr.write(
@@ -104,6 +124,54 @@ export class RemoteLLM implements LLM {
       h["Authorization"] = `Bearer ${this.apiKey}`;
     }
     return h;
+  }
+
+  private isFireworksBaseUrl(): boolean {
+    try {
+      return new URL(this.baseUrl).hostname.endsWith("fireworks.ai");
+    } catch {
+      return false;
+    }
+  }
+
+  private normalizeFireworksModel(model: string): string {
+    const trimmed = model.trim();
+    if (trimmed.startsWith("accounts/fireworks/models/")) {
+      return trimmed;
+    }
+    if (trimmed.startsWith("fireworks/")) {
+      return `accounts/fireworks/models/${trimmed.slice("fireworks/".length)}`;
+    }
+    return trimmed;
+  }
+
+  private resolveRemoteRerankModel(requestedModel?: string): string {
+    const configuredModel = this.isFireworksBaseUrl()
+      ? this.normalizeFireworksModel(this.rerankModel)
+      : this.rerankModel;
+    const override = requestedModel?.trim();
+
+    if (!override) {
+      return configuredModel;
+    }
+
+    if (!this.isFireworksBaseUrl()) {
+      return override;
+    }
+
+    if (
+      override.startsWith("fireworks/") ||
+      override.startsWith("accounts/fireworks/models/")
+    ) {
+      return this.normalizeFireworksModel(override);
+    }
+
+    if (debug) {
+      process.stderr.write(
+        `[remote-llm] rerank: ignoring non-Fireworks model override "${override}", using "${configuredModel}"\n`,
+      );
+    }
+    return configuredModel;
   }
 
   private async fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: number): Promise<Response> {
@@ -227,7 +295,7 @@ export class RemoteLLM implements LLM {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    const model = options?.model ?? this.rerankModel;
+    const model = this.resolveRemoteRerankModel(options?.model);
     if (documents.length === 0) {
       return { results: [], model };
     }
@@ -240,38 +308,95 @@ export class RemoteLLM implements LLM {
     const start = Date.now();
 
     try {
+      const isRetryableRerankError = (error: unknown): boolean => {
+        if (!(error instanceof Error)) {
+          return false;
+        }
+        const statusMatch = error.message.match(/Remote LLM error (\d+):/);
+        if (!statusMatch) {
+          return false;
+        }
+        const status = Number(statusMatch[1]);
+        return status === 429 || status >= 500;
+      };
+
       const rerankBatch = async (
         batchTexts: string[],
         offset: number,
         batchIndex: number,
         batchCount: number,
+        attempt = 0,
       ): Promise<{ index: number; relevance_score: number }[]> => {
+        const batchLabel = `${batchIndex + 1}/${batchCount}`;
+        const requestBody = JSON.stringify({
+          model,
+          query,
+          documents: batchTexts,
+          return_documents: false,
+        });
+
         if (debug && batchCount > 1) {
           process.stderr.write(
-            `[remote-llm] rerank batch ${batchIndex + 1}/${batchCount} (${batchTexts.length} docs)...\n`,
+            `[remote-llm] rerank batch ${batchLabel} (${batchTexts.length} docs, ${Buffer.byteLength(requestBody, "utf8")} bytes, attempt ${attempt + 1})...\n`,
           );
         }
 
-        const resp = await this.fetchWithTimeout(`${this.baseUrl}/rerank`, {
-          method: "POST",
-          headers: this.headers(),
-          body: JSON.stringify({
-            model,
-            query,
-            documents: batchTexts,
-            return_documents: false,
-          }),
-        }, this.rerankTimeoutMs);
+        try {
+          const resp = await this.fetchWithTimeout(`${this.baseUrl}/rerank`, {
+            method: "POST",
+            headers: this.headers(),
+            body: requestBody,
+          }, this.rerankTimeoutMs);
 
-        const json = await resp.json() as {
-          results?: { index: number; relevance_score: number }[];
-          data?: { index: number; relevance_score: number }[];
-        };
+          const json = await resp.json() as {
+            results?: { index: number; relevance_score: number }[];
+            data?: { index: number; relevance_score: number }[];
+          };
 
-        return (json.results ?? json.data ?? []).map((result) => ({
-          index: result.index + offset,
-          relevance_score: result.relevance_score,
-        }));
+          return (json.results ?? json.data ?? []).map((result) => ({
+            index: result.index + offset,
+            relevance_score: result.relevance_score,
+          }));
+        } catch (error) {
+          if (!isRetryableRerankError(error)) {
+            throw error;
+          }
+
+          if (attempt + 1 < MAX_RERANK_RETRIES) {
+            const delayMs = INITIAL_RERANK_RETRY_DELAY_MS * 2 ** attempt;
+            if (debug) {
+              process.stderr.write(
+                `[remote-llm] rerank batch ${batchLabel} retrying after ${delayMs}ms: ${error}\n`,
+              );
+            }
+            await delay(delayMs);
+            return rerankBatch(batchTexts, offset, batchIndex, batchCount, attempt + 1);
+          }
+
+          if (batchTexts.length > 1) {
+            const midpoint = Math.ceil(batchTexts.length / 2);
+            if (debug) {
+              process.stderr.write(
+                `[remote-llm] rerank batch ${batchLabel} splitting ${batchTexts.length} docs after retries exhausted\n`,
+              );
+            }
+            const firstHalf = await rerankBatch(
+              batchTexts.slice(0, midpoint),
+              offset,
+              batchIndex,
+              batchCount,
+            );
+            const secondHalf = await rerankBatch(
+              batchTexts.slice(midpoint),
+              offset + midpoint,
+              batchIndex,
+              batchCount,
+            );
+            return [...firstHalf, ...secondHalf];
+          }
+
+          throw error;
+        }
       };
 
       let ranked: { index: number; relevance_score: number }[];
