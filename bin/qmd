@@ -23,10 +23,16 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 # modules for Node.  The repo ships bun.lock, so without this check, source
 # builds that use npm would be incorrectly routed to bun, causing ABI
 # mismatches with better-sqlite3 / sqlite-vec (see #381).
-if [ -f "$DIR/package-lock.json" ]; then
-  exec node "$DIR/dist/cli/qmd.js" "$@"
-elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
-  exec bun "$DIR/dist/cli/qmd.js" "$@"
+# If dist/ exists, use compiled JS; otherwise fall back to TypeScript source via bun
+if [ -f "$DIR/dist/cli/qmd.js" ]; then
+  if [ -f "$DIR/package-lock.json" ]; then
+    exec node "$DIR/dist/cli/qmd.js" "$@"
+  elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
+    exec bun "$DIR/dist/cli/qmd.js" "$@"
+  else
+    exec node "$DIR/dist/cli/qmd.js" "$@"
+  fi
 else
-  exec node "$DIR/dist/cli/qmd.js" "$@"
+  # dist/ missing (build failed or wiped by package manager update) — run source directly
+  exec bun "$DIR/src/cli/qmd.ts" "$@"
 fi
